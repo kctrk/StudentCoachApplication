@@ -1,5 +1,11 @@
-import 'dart:async';
+// lib/modules/auth/screens/splash_screen.dart
+//
+// Uygulama açılışında oturum kontrolü yapar.
+// Giriş yaptıysa → Dashboard, yapmadıysa → Login
+
 import 'package:flutter/material.dart';
+import '../../../core/services/auth_service.dart';
+import '../../study/screens/dashboard_screen.dart';
 import 'login_screen.dart';
 
 class SplashScreen extends StatefulWidget {
@@ -13,17 +19,28 @@ class _SplashScreenState extends State<SplashScreen> {
   @override
   void initState() {
     super.initState();
+    _checkAuth();
+  }
 
-    Timer(const Duration(seconds: 2), () {
-      if (!mounted) return;
+  Future<void> _checkAuth() async {
+    // En az 1.5 sn splash göster
+    await Future.delayed(const Duration(milliseconds: 1500));
+    if (!mounted) return;
 
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(
-          builder: (_) => const LoginScreen(),
-        ),
-      );
-    });
+    final loggedIn = await AuthService.instance.isLoggedIn();
+
+    if (!mounted) return;
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => loggedIn
+            ? DashboardScreen(
+                isDarkMode: Theme.of(context).brightness == Brightness.dark,
+                onThemeChanged: (_) {},
+              )
+            : const LoginScreen(),
+      ),
+    );
   }
 
   @override
@@ -47,9 +64,7 @@ class _SplashScreenState extends State<SplashScreen> {
                 color: Color(0xFF6750A4),
               ),
             ),
-
             const SizedBox(height: 24),
-
             const Text(
               'Student Coach',
               style: TextStyle(
@@ -58,19 +73,12 @@ class _SplashScreenState extends State<SplashScreen> {
                 fontWeight: FontWeight.bold,
               ),
             ),
-
             const SizedBox(height: 8),
-
             const Text(
               'Derslerini planla, hedeflerine ulaş.',
-              style: TextStyle(
-                color: Colors.white70,
-                fontSize: 14,
-              ),
+              style: TextStyle(color: Colors.white70, fontSize: 14),
             ),
-
             const SizedBox(height: 40),
-
             const SizedBox(
               width: 28,
               height: 28,

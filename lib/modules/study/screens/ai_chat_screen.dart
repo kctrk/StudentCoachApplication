@@ -1,4 +1,11 @@
+// lib/modules/study/screens/ai_chat_screen.dart
+//
+// Gerçek Gemini API'ye bağlı sohbet ekranı.
+// Mesajlar SQLite'a kaydedilir, oturum bazlı geçmiş tutulur.
+
 import 'package:flutter/material.dart';
+import '../../../core/database/database_service.dart';
+import '../../../core/services/ai_service.dart';
 
 class AiScreen extends StatefulWidget {
   const AiScreen({super.key});
@@ -8,690 +15,299 @@ class AiScreen extends StatefulWidget {
 }
 
 class _AiScreenState extends State<AiScreen> {
-  final List<_ChatHistory> _chatHistory = [
-    _ChatHistory(
-      title: 'Fonksiyonlar hakkında yardım',
-      preview: 'Fonksiyonlarda tanım kümesini...',
-      time: 'Bugün',
-    ),
-    _ChatHistory(
-      title: 'Kuvvet ve hareket',
-      preview: 'Newton yasalarını açıklar mısın?',
-      time: 'Dün',
-    ),
-    _ChatHistory(
-      title: 'Paragraf soruları',
-      preview: 'Paragraf çözerken nelere dikkat...',
-      time: '2 gün önce',
-    ),
-  ];
+  final _msgCtrl      = TextEditingController();
+  final _scrollCtrl   = ScrollController();
+  final List<_Msg>    _messages  = [];
+  List<ChatSession>   _sessions  = [];
+  ChatSession?        _current;
+  bool                _isTyping  = false;
+  bool                _loadingSessions = true;
 
-  final List<_ChatMessage> _messages = [];
-  final TextEditingController _messageController = TextEditingController();
-
-  bool _isChatOpen = false;
-  bool _isTyping = false;
+  @override
+  void initState() {
+    super.initState();
+    _loadSessions();
+  }
 
   @override
   void dispose() {
-    _messageController.dispose();
+    _msgCtrl.dispose();
+    _scrollCtrl.dispose();
     super.dispose();
   }
 
-  void _startNewChat() {
+  // ── Oturum Yönetimi ────────────────────────────────────────
+
+  Future<void> _loadSessions() async {
+    final list = await DatabaseService.instance.getAllChatSessions();
+    if (mounted) setState(() { _sessions = list; _loadingSessions = false; });
+  }
+
+  Future<void> _startNewSession() async {
+    final session = await DatabaseService.instance.createChatSession(
+      'Yeni Sohbet ${DateTime.now().day}.${DateTime.now().month}',
+    );
     setState(() {
+      _sessions.insert(0, session);
+      _current = session;
       _messages.clear();
-      _isChatOpen = true;
     });
   }
 
-  void _openHistory(_ChatHistory chat) {
+  Future<void> _openSession(ChatSession session) async {
+    final rows = await DatabaseService.instance.getMessages(session.id);
     setState(() {
-      _messages.clear();
-      _isChatOpen = true;
-
-      _messages.add(
-        _ChatMessage(
-          text: chat.preview,
-          isUser: true,
-        ),
-      );
-
-      _messages.add(
-        const _ChatMessage(
-          text:
-          'Tabii! Bu konuda sana yardımcı olabilirim. '
-              'Sorunu biraz daha detaylandırırsan birlikte inceleyebiliriz.',
-          isUser: false,
-        ),
-      );
+      _current = session;
+      _messages
+        ..clear()
+        ..addAll(rows.map((r) => _Msg(text: r.text, isUser: r.isUser)));
     });
+    _scrollToBottom();
   }
 
-  void _sendMessage() {
-    final text = _messageController.text.trim();
+  // ── Mesaj Gönderme ─────────────────────────────────────────
 
+  Future<void> _send() async {
+    final text = _msgCtrl.text.trim();
     if (text.isEmpty || _isTyping) return;
 
-    setState(() {
-      _messages.add(
-        _ChatMessage(
-          text: text,
-          isUser: true,
-        ),
-      );
+    // Oturum yoksa oluştur
+    if (_current == null) await _startNewSession();
 
-      _messageController.clear();
+    _msgCtrl.clear();
+
+    // 1. Kullanıcı mesajını ekle
+    setState(() {
+      _messages.add(_Msg(text: text, isUser: true));
       _isTyping = true;
     });
+    _scrollToBottom();
 
-    Future.delayed(const Duration(milliseconds: 900), () {
-      if (!mounted) return;
+    // 2. DB'ye kaydet
+    await DatabaseService.instance.saveMessage(
+      sessionId: _current!.id,
+      text: text,
+      isUser: true,
+    );
 
+    // 3. AI'ya gönder
+    try {
+      final history = _messages
+          .where((m) => !m.isTyping)
+          .map((m) => AiMessage(text: m.text, isUser: m.isUser))
+          .toList();
+
+      final reply = await AiService.instance.sendText(
+        message: text,
+        history: history.length > 1
+            ? history.sublist(0, history.length - 1)
+            : [],
+      );
+
+      // 4. AI cevabını ekle + kaydet
       setState(() {
         _isTyping = false;
-
-        _messages.add(
-          const _ChatMessage(
-            text:
-            'Anladım! 🤖 Bu şu anda demo AI arayüzü. '
-                'Gerçek AI bağlantısı eklendiğinde sorunu detaylı şekilde '
-                'cevaplayabileceğim.',
-            isUser: false,
-          ),
-        );
+        _messages.add(_Msg(text: reply, isUser: false));
       });
+
+      await DatabaseService.instance.saveMessage(
+        sessionId: _current!.id,
+        text: reply,
+        isUser: false,
+      );
+
+      // 5. Oturumun başlığını güncelle (ilk mesajdan al)
+      if (_messages.length == 2) {
+        final title = text.length > 40
+            ? '${text.substring(0, 40)}...'
+            : text;
+        await DatabaseService.instance.deleteChatSession(_current!.id);
+        final updated = await DatabaseService.instance
+            .createChatSession(title);
+        // Mesajları yeni oturuma taşı
+        for (final m in _messages) {
+          await DatabaseService.instance.saveMessage(
+            sessionId: updated.id,
+            text: m.text,
+            isUser: m.isUser,
+          );
+        }
+        setState(() => _current = updated);
+        await _loadSessions();
+      }
+    } catch (e) {
+      setState(() {
+        _isTyping = false;
+        _messages.add(_Msg(text: '⚠️ $e', isUser: false));
+      });
+    }
+
+    _scrollToBottom();
+  }
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollCtrl.hasClients) {
+        _scrollCtrl.animateTo(
+          _scrollCtrl.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+        );
+      }
     });
   }
 
-  void _goBackToChats() {
-    FocusScope.of(context).unfocus();
-
-    setState(() {
-      _isChatOpen = false;
-      _isTyping = false;
-    });
-  }
+  // ── BUILD ──────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final colors = theme.colorScheme;
-    final isDark = theme.brightness == Brightness.dark;
+    final colors = Theme.of(context).colorScheme;
 
     return Scaffold(
-      backgroundColor: theme.scaffoldBackgroundColor,
       appBar: AppBar(
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        surfaceTintColor: Colors.transparent,
-        foregroundColor: colors.onSurface,
-        leading: _isChatOpen
-            ? IconButton(
-          onPressed: _goBackToChats,
-          icon: const Icon(Icons.arrow_back_rounded),
-        )
-            : null,
         title: Text(
-          _isChatOpen ? 'Yeni Sohbet' : 'AI Koç',
-          style: const TextStyle(
-            fontWeight: FontWeight.bold,
-          ),
+          _current?.title ?? 'AI Asistan',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
         ),
         actions: [
-          if (_isChatOpen)
-            IconButton(
-              onPressed: _startNewChat,
-              tooltip: 'Yeni Sohbet',
-              icon: const Icon(Icons.add_comment_outlined),
-            ),
-        ],
-      ),
-      body: _isChatOpen
-          ? _buildChatScreen(theme, colors)
-          : _buildHomeScreen(theme, colors, isDark),
-    );
-  }
-
-  Widget _buildHomeScreen(
-      ThemeData theme,
-      ColorScheme colors,
-      bool isDark,
-      ) {
-    return SafeArea(
-      child: ListView(
-        padding: const EdgeInsets.fromLTRB(20, 8, 20, 30),
-        children: [
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.all(22),
-            decoration: BoxDecoration(
-              gradient: const LinearGradient(
-                colors: [
-                  Color(0xFF6750A4),
-                  Color(0xFF8B6CCB),
-                ],
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-              ),
-              borderRadius: BorderRadius.circular(24),
-              boxShadow: [
-                BoxShadow(
-                  color: const Color(0xFF6750A4).withValues(alpha: 0.20),
-                  blurRadius: 20,
-                  offset: const Offset(0, 8),
-                ),
-              ],
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Container(
-                  width: 52,
-                  height: 52,
-                  decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: 0.16),
-                    borderRadius: BorderRadius.circular(16),
-                  ),
-                  child: const Icon(
-                    Icons.auto_awesome_rounded,
-                    color: Colors.white,
-                    size: 28,
-                  ),
-                ),
-
-                const SizedBox(height: 18),
-
-                const Text(
-                  'AI Koçun Burada 🤖',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 22,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-
-                const SizedBox(height: 8),
-
-                const Text(
-                  'Derslerin, konuların ve çalışma planın '
-                      'hakkında sorularını sorabilirsin.',
-                  style: TextStyle(
-                    color: Colors.white70,
-                    fontSize: 14,
-                    height: 1.4,
-                  ),
-                ),
-
-                const SizedBox(height: 20),
-
-                SizedBox(
-                  width: double.infinity,
-                  height: 50,
-                  child: ElevatedButton.icon(
-                    onPressed: _startNewChat,
-                    icon: const Icon(Icons.chat_bubble_outline_rounded),
-                    label: const Text(
-                      'Yeni Sohbet Başlat',
-                      style: TextStyle(
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.white,
-                      foregroundColor: const Color(0xFF6750A4),
-                      elevation: 0,
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(15),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ),
+          // Geçmiş oturumlar
+          IconButton(
+            icon: const Icon(Icons.history_rounded),
+            tooltip: 'Sohbet Geçmişi',
+            onPressed: () => _showSessionsSheet(),
           ),
-
-          const SizedBox(height: 30),
-
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text(
-                'Geçmiş Sohbetler',
-                style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.bold,
-                  color: colors.onSurface,
-                ),
-              ),
-
-              TextButton.icon(
-                onPressed: _startNewChat,
-                icon: const Icon(Icons.add_rounded, size: 20),
-                label: const Text('Yeni'),
-              ),
-            ],
-          ),
-
-          const SizedBox(height: 10),
-
-          if (_chatHistory.isEmpty)
-            _buildEmptyHistory(colors)
-          else
-            ..._chatHistory.map(
-                  (chat) => _ChatHistoryCard(
-                chat: chat,
-                onTap: () => _openHistory(chat),
-              ),
-            ),
-
-          const SizedBox(height: 24),
-
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: isDark
-                  ? colors.surfaceContainerHighest
-                  : const Color(0xFFF7F3FD),
-              borderRadius: BorderRadius.circular(18),
-              border: Border.all(
-                color: colors.outline.withValues(alpha: 0.18),
-              ),
-            ),
-            child: Row(
-              children: [
-                Icon(
-                  Icons.lightbulb_outline_rounded,
-                  color: colors.primary,
-                ),
-
-                const SizedBox(width: 12),
-
-                Expanded(
-                  child: Text(
-                    'AI Koçuna ders soruları, konu anlatımları '
-                        've çalışma önerileri sorabilirsin.',
-                    style: TextStyle(
-                      fontSize: 13,
-                      color: colors.onSurfaceVariant,
-                      height: 1.4,
-                    ),
-                  ),
-                ),
-              ],
-            ),
+          // Yeni sohbet
+          IconButton(
+            icon: const Icon(Icons.add_rounded),
+            tooltip: 'Yeni Sohbet',
+            onPressed: _startNewSession,
           ),
         ],
       ),
-    );
-  }
 
-  Widget _buildEmptyHistory(ColorScheme colors) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(
-        horizontal: 20,
-        vertical: 35,
-      ),
-      decoration: BoxDecoration(
-        color: colors.surface,
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(
-          color: colors.outline.withValues(alpha: 0.20),
-        ),
-      ),
-      child: Column(
+      body: Column(
         children: [
-          Icon(
-            Icons.chat_bubble_outline_rounded,
-            size: 42,
-            color: colors.onSurfaceVariant.withValues(alpha: 0.55),
-          ),
-
-          const SizedBox(height: 12),
-
-          Text(
-            'Henüz sohbet yok',
-            style: TextStyle(
-              fontSize: 16,
-              fontWeight: FontWeight.bold,
-              color: colors.onSurface,
-            ),
-          ),
-
-          const SizedBox(height: 6),
-
-          Text(
-            'İlk sohbetini başlatarak AI Koçuna soru sor.',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              fontSize: 13,
-              color: colors.onSurfaceVariant,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildChatScreen(
-      ThemeData theme,
-      ColorScheme colors,
-      ) {
-    return SafeArea(
-      child: Column(
-        children: [
+          // ── Mesaj Listesi ────────────────────────────────────
           Expanded(
             child: _messages.isEmpty
-                ? _buildChatWelcome(colors)
+                ? _EmptyState(onStart: _startNewSession)
                 : ListView.builder(
-              padding: const EdgeInsets.fromLTRB(
-                16,
-                16,
-                16,
-                20,
-              ),
-              itemCount: _messages.length,
-              itemBuilder: (context, index) {
-                return _MessageBubble(
-                  message: _messages[index],
-                );
-              },
-            ),
+                    controller: _scrollCtrl,
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 16, vertical: 12),
+                    itemCount:
+                        _messages.length + (_isTyping ? 1 : 0),
+                    itemBuilder: (_, i) {
+                      if (_isTyping && i == _messages.length) {
+                        return const _TypingBubble();
+                      }
+                      return _MessageBubble(msg: _messages[i]);
+                    },
+                  ),
           ),
 
-          if (_isTyping)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
-              child: Align(
-                alignment: Alignment.centerLeft,
-                child: Row(
-                  children: [
-                    CircleAvatar(
-                      radius: 15,
-                      backgroundColor: colors.primaryContainer,
-                      child: Icon(
-                        Icons.auto_awesome_rounded,
-                        size: 16,
-                        color: colors.onPrimaryContainer,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Text(
-                      'AI Koç yazıyor...',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: colors.onSurfaceVariant,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-          _buildMessageInput(theme, colors),
+          // ── Giriş Alanı ─────────────────────────────────────
+          _InputBar(
+            controller: _msgCtrl,
+            isTyping: _isTyping,
+            onSend: _send,
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildChatWelcome(ColorScheme colors) {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(30),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Container(
-              width: 72,
-              height: 72,
-              decoration: BoxDecoration(
-                color: colors.primaryContainer,
-                shape: BoxShape.circle,
-              ),
-              child: Icon(
-                Icons.auto_awesome_rounded,
-                size: 36,
-                color: colors.onPrimaryContainer,
-              ),
-            ),
+  // ── Oturum Listesi Bottom Sheet ────────────────────────────
 
-            const SizedBox(height: 18),
-
-            Text(
-              'Nasıl yardımcı olabilirim?',
-              style: TextStyle(
-                fontSize: 21,
-                fontWeight: FontWeight.bold,
-                color: colors.onSurface,
-              ),
-            ),
-
-            const SizedBox(height: 8),
-
-            Text(
-              'Bir konu sor, çalışma planın hakkında konuş '
-                  'veya anlamadığın bir konuyu birlikte inceleyelim.',
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                fontSize: 14,
-                height: 1.5,
-                color: colors.onSurfaceVariant,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildMessageInput(
-      ThemeData theme,
-      ColorScheme colors,
-      ) {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
-      decoration: BoxDecoration(
-        color: theme.scaffoldBackgroundColor,
-        border: Border(
-          top: BorderSide(
-            color: colors.outline.withValues(alpha: 0.15),
-          ),
-        ),
-      ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          Expanded(
-            child: TextField(
-              controller: _messageController,
-              minLines: 1,
-              maxLines: 5,
-              textInputAction: TextInputAction.newline,
-              style: TextStyle(
-                color: colors.onSurface,
-              ),
-              decoration: InputDecoration(
-                hintText: 'AI Koçuna bir şey sor...',
-                hintStyle: TextStyle(
-                  color: colors.onSurfaceVariant.withValues(alpha: 0.65),
+  void _showSessionsSheet() {
+    showModalBottomSheet(
+      context: context,
+      builder: (_) => _loadingSessions
+          ? const Center(child: CircularProgressIndicator())
+          : _sessions.isEmpty
+              ? const Center(child: Text('Henüz sohbet yok.'))
+              : ListView.builder(
+                  padding: const EdgeInsets.all(16),
+                  itemCount: _sessions.length,
+                  itemBuilder: (ctx, i) {
+                    final s = _sessions[i];
+                    return ListTile(
+                      leading: const Icon(Icons.chat_bubble_outline_rounded),
+                      title: Text(s.title),
+                      subtitle: Text(
+                        '${s.updatedAt.day}.${s.updatedAt.month}.${s.updatedAt.year}',
+                      ),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        _openSession(s);
+                      },
+                    );
+                  },
                 ),
-                filled: true,
-                fillColor: colors.surface,
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 13,
-                ),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(18),
-                  borderSide: BorderSide(
-                    color: colors.outline.withValues(alpha: 0.20),
-                  ),
-                ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(18),
-                  borderSide: BorderSide(
-                    color: colors.outline.withValues(alpha: 0.20),
-                  ),
-                ),
-                focusedBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(18),
-                  borderSide: BorderSide(
-                    color: colors.primary,
-                  ),
-                ),
-              ),
-            ),
-          ),
-
-          const SizedBox(width: 8),
-
-          IconButton(
-            onPressed: _isTyping ? null : _sendMessage,
-            style: IconButton.styleFrom(
-              backgroundColor: colors.primary,
-              foregroundColor: colors.onPrimary,
-              disabledBackgroundColor:
-              colors.onSurface.withValues(alpha: 0.10),
-            ),
-            icon: const Icon(Icons.send_rounded),
-          ),
-        ],
-      ),
     );
   }
 }
 
-class _ChatHistory {
-  final String title;
-  final String preview;
-  final String time;
+// ── Veri Modeli ────────────────────────────────────────────────
 
-  const _ChatHistory({
-    required this.title,
-    required this.preview,
-    required this.time,
-  });
-}
-
-class _ChatMessage {
+class _Msg {
   final String text;
-  final bool isUser;
-
-  const _ChatMessage({
-    required this.text,
-    required this.isUser,
-  });
+  final bool   isUser;
+  final bool   isTyping;
+  const _Msg({required this.text, required this.isUser, this.isTyping = false});
 }
 
-class _ChatHistoryCard extends StatelessWidget {
-  final _ChatHistory chat;
-  final VoidCallback onTap;
+// ── Widgets ────────────────────────────────────────────────────
 
-  const _ChatHistoryCard({
-    required this.chat,
-    required this.onTap,
-  });
+class _EmptyState extends StatelessWidget {
+  final VoidCallback onStart;
+  const _EmptyState({required this.onStart});
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final colors = theme.colorScheme;
-
-    return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      decoration: BoxDecoration(
-        color: colors.surface,
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(
-          color: colors.outline.withValues(alpha: 0.20),
-        ),
-      ),
-      child: ListTile(
-        onTap: onTap,
-        contentPadding: const EdgeInsets.symmetric(
-          horizontal: 16,
-          vertical: 6,
-        ),
-        leading: Container(
-          width: 44,
-          height: 44,
-          decoration: BoxDecoration(
-            color: colors.primaryContainer,
-            borderRadius: BorderRadius.circular(13),
+    final colors = Theme.of(context).colorScheme;
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.auto_awesome_rounded,
+              size: 64, color: colors.primary.withValues(alpha: 0.5)),
+          const SizedBox(height: 16),
+          const Text('AI Asistan hazır!',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+          const SizedBox(height: 8),
+          const Text(
+            'Matematik, fen bilimleri, programlama\nve daha fazlası için sor.',
+            textAlign: TextAlign.center,
           ),
-          child: Icon(
-            Icons.chat_bubble_outline_rounded,
-            color: colors.onPrimaryContainer,
+          const SizedBox(height: 20),
+          FilledButton.tonal(
+            onPressed: onStart,
+            child: const Text('Sohbete Başla'),
           ),
-        ),
-        title: Text(
-          chat.title,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: TextStyle(
-            fontSize: 14,
-            fontWeight: FontWeight.bold,
-            color: colors.onSurface,
-          ),
-        ),
-        subtitle: Padding(
-          padding: const EdgeInsets.only(top: 4),
-          child: Text(
-            chat.preview,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: 12,
-              color: colors.onSurfaceVariant,
-            ),
-          ),
-        ),
-        trailing: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Text(
-              chat.time,
-              style: TextStyle(
-                fontSize: 11,
-                color: colors.onSurfaceVariant,
-              ),
-            ),
-            const SizedBox(height: 4),
-            Icon(
-              Icons.chevron_right_rounded,
-              color: colors.onSurfaceVariant,
-            ),
-          ],
-        ),
+        ],
       ),
     );
   }
 }
 
 class _MessageBubble extends StatelessWidget {
-  final _ChatMessage message;
-
-  const _MessageBubble({
-    required this.message,
-  });
+  final _Msg msg;
+  const _MessageBubble({required this.msg});
 
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
 
-    if (message.isUser) {
+    if (msg.isUser) {
       return Align(
         alignment: Alignment.centerRight,
         child: Container(
-          constraints: const BoxConstraints(
-            maxWidth: 300,
-          ),
+          constraints: BoxConstraints(
+              maxWidth: MediaQuery.of(context).size.width * 0.78),
           margin: const EdgeInsets.only(bottom: 12),
-          padding: const EdgeInsets.symmetric(
-            horizontal: 16,
-            vertical: 12,
-          ),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
           decoration: BoxDecoration(
             color: colors.primary,
             borderRadius: const BorderRadius.only(
@@ -701,13 +317,9 @@ class _MessageBubble extends StatelessWidget {
               bottomRight: Radius.circular(5),
             ),
           ),
-          child: Text(
-            message.text,
-            style: TextStyle(
-              color: colors.onPrimary,
-              fontSize: 14,
-              height: 1.4,
-            ),
+          child: SelectableText(
+            msg.text,
+            style: TextStyle(color: colors.onPrimary, height: 1.4),
           ),
         ),
       );
@@ -721,25 +333,17 @@ class _MessageBubble extends StatelessWidget {
           CircleAvatar(
             radius: 17,
             backgroundColor: colors.primaryContainer,
-            child: Icon(
-              Icons.auto_awesome_rounded,
-              size: 18,
-              color: colors.onPrimaryContainer,
-            ),
+            child: Icon(Icons.auto_awesome_rounded,
+                size: 18, color: colors.onPrimaryContainer),
           ),
-
           const SizedBox(width: 8),
-
           Flexible(
             child: Container(
-              constraints: const BoxConstraints(
-                maxWidth: 310,
-              ),
+              constraints: BoxConstraints(
+                  maxWidth: MediaQuery.of(context).size.width * 0.72),
               margin: const EdgeInsets.only(bottom: 12),
-              padding: const EdgeInsets.symmetric(
-                horizontal: 16,
-                vertical: 12,
-              ),
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
               decoration: BoxDecoration(
                 color: colors.surface,
                 borderRadius: const BorderRadius.only(
@@ -749,18 +353,151 @@ class _MessageBubble extends StatelessWidget {
                   bottomRight: Radius.circular(18),
                 ),
                 border: Border.all(
-                  color: colors.outline.withValues(alpha: 0.20),
-                ),
+                    color: colors.outline.withValues(alpha: 0.2)),
               ),
-              child: Text(
-                message.text,
-                style: TextStyle(
-                  color: colors.onSurface,
-                  fontSize: 14,
-                  height: 1.4,
-                ),
+              child: SelectableText(
+                msg.text,
+                style: TextStyle(color: colors.onSurface, height: 1.4),
               ),
             ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _TypingBubble extends StatelessWidget {
+  const _TypingBubble();
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 12, left: 42),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        decoration: BoxDecoration(
+          color: colors.surface,
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: colors.outline.withValues(alpha: 0.2)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _Dot(delay: 0),
+            const SizedBox(width: 4),
+            _Dot(delay: 150),
+            const SizedBox(width: 4),
+            _Dot(delay: 300),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _Dot extends StatefulWidget {
+  final int delay;
+  const _Dot({required this.delay});
+
+  @override
+  State<_Dot> createState() => _DotState();
+}
+
+class _DotState extends State<_Dot> with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
+  late final Animation<double> _anim;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 600),
+    );
+    _anim = Tween(begin: 0.3, end: 1.0).animate(_ctrl);
+    Future.delayed(Duration(milliseconds: widget.delay), () {
+      if (mounted) _ctrl.repeat(reverse: true);
+    });
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return FadeTransition(
+      opacity: _anim,
+      child: Container(
+        width: 8,
+        height: 8,
+        decoration: BoxDecoration(
+          color: colors.primary,
+          shape: BoxShape.circle,
+        ),
+      ),
+    );
+  }
+}
+
+class _InputBar extends StatelessWidget {
+  final TextEditingController controller;
+  final bool isTyping;
+  final VoidCallback onSend;
+
+  const _InputBar({
+    required this.controller,
+    required this.isTyping,
+    required this.onSend,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+      decoration: BoxDecoration(
+        color: colors.surface,
+        border: Border(top: BorderSide(color: colors.outline.withValues(alpha: 0.15))),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: TextField(
+              controller: controller,
+              maxLines: 4,
+              minLines: 1,
+              enabled: !isTyping,
+              onSubmitted: (_) => onSend(),
+              decoration: InputDecoration(
+                hintText: 'Bir şeyler sor...',
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(24),
+                  borderSide: BorderSide.none,
+                ),
+                filled: true,
+                fillColor: colors.surfaceContainerHighest,
+                contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 20, vertical: 12),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          IconButton(
+            onPressed: isTyping ? null : onSend,
+            style: IconButton.styleFrom(
+              backgroundColor: colors.primary,
+              foregroundColor: colors.onPrimary,
+              disabledBackgroundColor:
+                  colors.onSurface.withValues(alpha: 0.10),
+            ),
+            icon: const Icon(Icons.send_rounded),
           ),
         ],
       ),

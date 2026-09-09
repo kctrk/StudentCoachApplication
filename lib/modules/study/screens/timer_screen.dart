@@ -1,6 +1,8 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import '../../../core/database/database_service.dart';
+import '../../../core/services/notification_service.dart';
 
 class TimerScreen extends StatefulWidget {
   final String subject;
@@ -55,13 +57,7 @@ class _TimerScreenState extends State<TimerScreen> {
           });
         } else {
           _stopTimer();
-
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Çalışma süren tamamlandı! 🎉'),
-              behavior: SnackBarBehavior.floating,
-            ),
-          );
+          _onStudyCompleted();
         }
       },
     );
@@ -76,6 +72,22 @@ class _TimerScreenState extends State<TimerScreen> {
     setState(() {
       _isRunning = false;
     });
+  }
+
+  /// Zamanlayıcı bitince DB'ye kaydet + bildirim gönder
+  Future<void> _onStudyCompleted() async {
+    await DatabaseService.instance.saveStudySession(
+      subject: widget.subject,
+      durationMinutes: _selectedMinutes,
+    );
+    await NotificationService.showStudyCompletedNotification();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Çalışma tamamlandı ve kaydedildi! 🎉'),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
   }
 
   void _resetTimer() {

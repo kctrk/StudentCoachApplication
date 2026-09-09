@@ -1,17 +1,58 @@
-# studentcoachapplication
+# Student Coach
 
-A new Flutter project.
+Öğrenciler için geliştirilmiş Flutter tabanlı AI destekli çalışma asistanı.
 
-## Getting Started
+## Özellikler
 
-This project is a starting point for a Flutter application.
+- **AI Sohbet**: Gemini API ile matematik, fizik, programlama ve daha fazlası
+- **Tara & Çöz**: Kamera ile soru fotoğrafı çek → OCR → AI adım adım çözüm
+- **Zamanlayıcı (Pomodoro)**: Çalışma süresi takibi ve otomatik DB kaydı
+- **Geçmiş**: Tüm çözümlere ve sohbetlere kolayca eriş
+- **Auth**: Kayıt / Giriş sistemi (Firebase'e geçiş için hazır)
 
-A few resources to get you started if this is your first Flutter project:
+## Kurulum
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+### 1. Bağımlılıkları Yükle
+```bash
+flutter pub get
+```
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+### 2. API Anahtarı Ekle
+`lib/core/services/ai_service.dart` dosyasında:
+```dart
+static const String apiKey = 'GEMINI_API_KEY_BURAYA';
+```
+Ücretsiz anahtar: https://aistudio.google.com/app/apikey
+
+### 3. Çalıştır
+```bash
+flutter run
+```
+
+## Proje Yapısı
+
+```
+lib/
+├── core/
+│   ├── constants/     → Sistem promptları
+│   ├── database/      → SQLite (DatabaseService)
+│   └── services/      → AI, Auth, Notification
+├── modules/
+│   ├── auth/          → Login, Register, Splash
+│   ├── history/       → Geçmiş çözümler
+│   ├── scanner/       → OCR + AI çözüm
+│   └── study/         → Dashboard, Timer, AI Chat
+└── main.dart
+```
+
+## Teknolojiler
+
+| Paket | Kullanım |
+|---|---|
+| `dio` | Gemini API HTTP istekleri |
+| `sqflite` | Yerel SQLite veritabanı |
+| `shared_preferences` | Auth oturumu |
+| `google_mlkit_text_recognition` | OCR (offline) |
+| `image_picker` | Kamera & galeri |
+| `flutter_local_notifications` | Bildirimler |
+| `flutter_riverpod` | State management |
